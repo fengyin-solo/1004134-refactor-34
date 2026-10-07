@@ -28,32 +28,59 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
+// 每个模块都有一个和权威 status 同义的业务状态字段（登记字段的最后一项），
+// 列表动态列读它、「当前状态」列读 status，保存时必须写同一份结论。
+function statusField(meta: ModuleMeta): string {
+  return meta.fields[meta.fields.length - 1]
+}
+
+// 同一条记录在同一批次内被重复提交时，只认第一次提交的结果，后续提交直接复用，
+// 避免后到的写入把先到的结论覆盖掉。
+const inflight = new Map<string, ActionResult>()
+
+function inflightKey(key: string, id: number): string {
+  return `${key}:${id}`
+}
+
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
   }
+  const lockKey = inflightKey(key, id)
+  const first = inflight.get(lockKey)
+  if (first) {
+    return first
+  }
   const rows = listRows(key)
   const index = rows.findIndex((row) => Number(row.id) === id)
   if (index < 0) {
-    return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
+    const result = { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
+    inflight.set(lockKey, result)
+    queueMicrotask(() => inflight.delete(lockKey))
+    return result
   }
   const current = String(rows[index].status)
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
   const lastStatus = meta.statuses[meta.statuses.length - 1]
+  // 保存顺序统一为：权威 status 与业务状态字段写同一个值，读取侧无论读哪一列结论都一致。
   const updated: EntryRow = {
     ...rows[index],
     status: target,
+    [statusField(meta)]: target,
     pending: target !== lastStatus,
     abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
   }
   const next = [...rows]
   next[index] = updated
   saveRows(key, next)
-  return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
+  const result: ActionResult = { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
+  inflight.set(lockKey, result)
+  queueMicrotask(() => inflight.delete(lockKey))
+  return result
 }
 
 export function resetModule(key: string): PageResult {
