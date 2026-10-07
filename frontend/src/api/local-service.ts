@@ -1,9 +1,20 @@
 import { MODULE_BY_KEY } from '@/data/modules'
-import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import {
+  allRows,
+  commitMany,
+  listRows,
+  resetRows,
+  statusFieldFor,
+} from '@/data/local-store'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
+
+// 特种车辆的另一个入口：替代设备台账。车辆状态结论要同步给同编号的装卸设备。
+const REPLACEMENT_LEDGER: Record<string, string> = {
+  special_vehicle: 'load_equip',
+}
 
 export function moduleMeta(key: string): ModuleMeta {
   const meta = MODULE_BY_KEY.get(key)
@@ -28,6 +39,32 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
+// 保存顺序：规范状态先落定，再镜像到业务状态字段，保证详情页与维修台读到同一个结论。
+function withStatus(row: EntryRow, meta: ModuleMeta, target: string, abnormal: boolean): EntryRow {
+  const updated: EntryRow = {
+    ...row,
+    status: target,
+    pending: target !== meta.statuses[meta.statuses.length - 1],
+    abnormal,
+  }
+  const statusField = meta.fields[meta.fields.length - 1]
+  if (statusField) {
+    updated[statusField] = target
+  }
+  return updated
+}
+
+// 特种车辆的可用结论同步到替代设备台账：待命=可执行任务，其余结论一一对应。
+function replacementStatusFor(target: string): string {
+  const mapping: Record<string, string> = {
+    待命: '待机',
+    出车中: '运行中',
+    维保中: '维保中',
+    已停用: '已报修',
+  }
+  return mapping[target] ?? target
+}
+
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
@@ -39,20 +76,50 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (index < 0) {
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
   }
-  const current = String(rows[index].status)
-  if (current === target) {
+  const expectedStatus = String(rows[index].status)
+  if (expectedStatus === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
-  const lastStatus = meta.statuses[meta.statuses.length - 1]
-  const updated: EntryRow = {
-    ...rows[index],
-    status: target,
-    pending: target !== lastStatus,
-    abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
+
+  const updated = withStatus(
+    rows[index],
+    meta,
+    target,
+    NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
+  )
+  const nextRows = [...rows]
+  nextRows[index] = updated
+
+  const changes = [{ key, rows: nextRows }]
+
+  // 另一个入口（替代设备台账）同步同一条记录的可用结论，一次写入落库。
+  const replacementKey = REPLACEMENT_LEDGER[key]
+  let replacementMeta: ModuleMeta | undefined
+  let replacementRows: EntryRow[] | undefined
+  if (replacementKey) {
+    replacementMeta = MODULE_BY_KEY.get(replacementKey)
+    const field = replacementMeta ? statusFieldFor(replacementKey) : undefined
+    replacementRows = listRows(replacementKey)
+    const replacedTarget = replacementStatusFor(target)
+    replacementRows = replacementRows.map((row) =>
+      Number(row.id) === id && replacementMeta && field
+        ? withStatus(row, replacementMeta, replacedTarget, updated.abnormal)
+        : row,
+    )
+    changes.push({ key: replacementKey, rows: replacementRows })
   }
-  const next = [...rows]
-  next[index] = updated
-  saveRows(key, next)
+
+  // 并发提交：以进入动作时的状态为条件，只有首个提交能写进去，后续提交原样驳回。
+  const accepted = commitMany(changes, { key, id, expectedStatus })
+  if (!accepted) {
+    const latest = listRows(key).find((row) => Number(row.id) === id)
+    return {
+      ok: false,
+      message: latest
+        ? `${meta.entity}已被先到的提交更新为「${latest.status}」，本次操作未生效`
+        : `${meta.entity}状态已变化，请刷新后重试`,
+    }
+  }
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
